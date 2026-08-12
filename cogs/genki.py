@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -8,6 +9,7 @@ from discord.ext import commands
 
 GENKI_REGEN_MINUTES = float(os.getenv("GENKI_REGEN_MINUTES", "5"))
 GENKI_MAX = int(os.getenv("GENKI_MAX", "50"))
+JST = ZoneInfo("Asia/Tokyo")
 
 
 class GenkiCog(commands.Cog):
@@ -40,7 +42,7 @@ class GenkiCog(commands.Cog):
             return
 
         minutes = missing * GENKI_REGEN_MINUTES
-        ready_at = datetime.now() + timedelta(minutes=minutes)
+        ready_at = datetime.now(JST) + timedelta(minutes=minutes)
 
         self._cancel_existing(interaction.user.id)
 
@@ -56,7 +58,7 @@ class GenkiCog(commands.Cog):
 
         await interaction.response.send_message(
             f"ゲンキ全回復まで約 {minutes:.0f} 分です。"
-            f"（{ready_at.strftime('%H:%M')} 頃に通知します）"
+            f"（{ready_at.strftime('%H:%M')} 頃に通知します・日本時間）"
         )
 
     @genki_group.command(name="check", description="設定中のゲンキ回復タイマーを確認します")
@@ -66,7 +68,7 @@ class GenkiCog(commands.Cog):
             await interaction.response.send_message("設定中のタイマーはありません。", ephemeral=True)
             return
 
-        remaining = timer["ready_at"] - datetime.now()
+        remaining = timer["ready_at"] - datetime.now(JST)
         if remaining.total_seconds() <= 0:
             await interaction.response.send_message("まもなく通知します。", ephemeral=True)
             return
