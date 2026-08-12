@@ -51,6 +51,14 @@ python bot.py
 起動後、Discordサーバーで `/genki` コマンドが使えるようになります
 （反映まで数分かかる場合があります）。
 
+## Railwayでのデプロイ
+
+このリポジトリには `Procfile`（`worker: python bot.py`）を含めているため、
+Railwayにリポジトリを接続するだけでビルド・起動コマンドを自動認識します。
+
+- Railwayの Variables に `DISCORD_TOKEN`（と必要なら `GENKI_REGEN_MINUTES`）を設定してください（`.env` ファイルは不要です）。
+- Webサーバーではなくbotプロセスなので、Railway側で公開URL/ヘルスチェックの設定は不要です。
+
 ## 今後の拡張予定
 
 - 妖怪図鑑検索（外部サイトスクレイピング）
