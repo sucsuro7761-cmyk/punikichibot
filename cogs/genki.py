@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 GENKI_REGEN_MINUTES = float(os.getenv("GENKI_REGEN_MINUTES", "5"))
+GENKI_MAX = int(os.getenv("GENKI_MAX", "50"))
 
 
 class GenkiCog(commands.Cog):
@@ -23,17 +24,17 @@ class GenkiCog(commands.Cog):
         if existing:
             existing["task"].cancel()
 
-    @genki_group.command(name="set", description="現在値と最大値からげんき全回復までの通知を予約します")
-    @app_commands.describe(current="現在のげんき", max="げんきの最大値")
-    async def set_timer(self, interaction: discord.Interaction, current: int, max: int):
-        if max <= 0 or current < 0 or current > max:
+    @genki_group.command(name="set", description=f"現在値からげんき全回復までの通知を予約します(最大値は{GENKI_MAX}固定)")
+    @app_commands.describe(current="現在のげんき")
+    async def set_timer(self, interaction: discord.Interaction, current: int):
+        if current < 0 or current > GENKI_MAX:
             await interaction.response.send_message(
-                "入力値が正しくありません。0 <= 現在値 <= 最大値 で指定してください。",
+                f"入力値が正しくありません。0 〜 {GENKI_MAX} の範囲で指定してください。",
                 ephemeral=True,
             )
             return
 
-        missing = max - current
+        missing = GENKI_MAX - current
         if missing == 0:
             await interaction.response.send_message("すでに全回復しています！", ephemeral=True)
             return
@@ -48,10 +49,10 @@ class GenkiCog(commands.Cog):
                 user_id=interaction.user.id,
                 channel_id=interaction.channel_id,
                 delay_seconds=minutes * 60,
-                max_value=max,
+                max_value=GENKI_MAX,
             )
         )
-        self.timers[interaction.user.id] = {"task": task, "ready_at": ready_at, "max": max}
+        self.timers[interaction.user.id] = {"task": task, "ready_at": ready_at, "max": GENKI_MAX}
 
         await interaction.response.send_message(
             f"げんき全回復まで約 {minutes:.0f} 分です。"
