@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-GENKI_REGEN_MINUTES = float(os.getenv("GENKI_REGEN_MINUTES", "3"))
+GENKI_REGEN_MINUTES = float(os.getenv("GENKI_REGEN_MINUTES", "5"))
 
 
 class GenkiCog(commands.Cog):
