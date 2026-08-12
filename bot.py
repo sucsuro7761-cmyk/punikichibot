@@ -28,6 +28,7 @@ async def main():
         raise RuntimeError("DISCORD_TOKEN が設定されていません。.env を確認してください。")
     async with bot:
         await bot.load_extension("cogs.genki")
+        await bot.load_extension("cogs.otasuke")
         await bot.start(TOKEN)
 
 
