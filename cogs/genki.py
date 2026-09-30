@@ -26,9 +26,24 @@ class GenkiCog(commands.Cog):
         if existing:
             existing["task"].cancel()
 
-    @genki_group.command(name="set", description=f"現在値からゲンキ全回復までの通知を予約します(最大値は{GENKI_MAX}固定)")
-    @app_commands.describe(current="現在のゲンキ")
-    async def set_timer(self, interaction: discord.Interaction, current: int):
+    @genki_group.command(
+        name="set", description=f"現在値から指定したゲンキ量まで貯まる通知を予約します(省略時は最大値{GENKI_MAX})"
+    )
+    @app_commands.describe(
+        current="現在のゲンキ", target=f"貯めたいゲンキ量(省略時は最大値{GENKI_MAX})"
+    )
+    async def set_timer(
+        self, interaction: discord.Interaction, current: int, target: int | None = None
+    ):
+        target_value = target if target is not None else GENKI_MAX
+
+        if target_value <= 0 or target_value > GENKI_MAX:
+            await interaction.response.send_message(
+                f"目標値が正しくありません。1 〜 {GENKI_MAX} の範囲で指定してください。",
+                ephemeral=True,
+            )
+            return
+
         if current < 0 or current > GENKI_MAX:
             await interaction.response.send_message(
                 f"入力値が正しくありません。0 〜 {GENKI_MAX} の範囲で指定してください。",
@@ -36,9 +51,9 @@ class GenkiCog(commands.Cog):
             )
             return
 
-        missing = GENKI_MAX - current
-        if missing == 0:
-            await interaction.response.send_message("すでに全回復しています！", ephemeral=True)
+        missing = target_value - current
+        if missing <= 0:
+            await interaction.response.send_message("すでに目標値に到達しています！", ephemeral=True)
             return
 
         minutes = missing * GENKI_REGEN_MINUTES
@@ -51,13 +66,17 @@ class GenkiCog(commands.Cog):
                 user_id=interaction.user.id,
                 channel_id=interaction.channel_id,
                 delay_seconds=minutes * 60,
-                max_value=GENKI_MAX,
+                target_value=target_value,
             )
         )
-        self.timers[interaction.user.id] = {"task": task, "ready_at": ready_at, "max": GENKI_MAX}
+        self.timers[interaction.user.id] = {
+            "task": task,
+            "ready_at": ready_at,
+            "target": target_value,
+        }
 
         await interaction.response.send_message(
-            f"ゲンキ全回復まで約 {minutes:.0f} 分です。"
+            f"ゲンキが {target_value} まで貯まるまで約 {minutes:.0f} 分です。"
             f"（{ready_at.strftime('%H:%M')} 頃に通知します・日本時間）"
         )
 
@@ -75,7 +94,8 @@ class GenkiCog(commands.Cog):
 
         minutes, seconds = divmod(int(remaining.total_seconds()), 60)
         await interaction.response.send_message(
-            f"ゲンキ全回復まで残り {minutes}分{seconds}秒です。", ephemeral=True
+            f"ゲンキが {timer['target']} まで貯まるまで残り {minutes}分{seconds}秒です。",
+            ephemeral=True,
         )
 
     @genki_group.command(name="cancel", description="設定中のゲンキ回復タイマーを取り消します")
@@ -88,7 +108,7 @@ class GenkiCog(commands.Cog):
         await interaction.response.send_message("タイマーを取り消しました。", ephemeral=True)
 
     async def _notify_when_ready(
-        self, user_id: int, channel_id: int, delay_seconds: float, max_value: int
+        self, user_id: int, channel_id: int, delay_seconds: float, target_value: int
     ):
         try:
             await asyncio.sleep(delay_seconds)
@@ -100,7 +120,9 @@ class GenkiCog(commands.Cog):
         if channel is None:
             return
 
-        await channel.send(f"<@{user_id}> ゲンキが全回復しました！（{max_value}/{max_value}）")
+        await channel.send(
+            f"<@{user_id}> ゲンキが {target_value} まで貯まりました！（{target_value}/{GENKI_MAX}）"
+        )
 
 
 async def setup(bot: commands.Bot):
