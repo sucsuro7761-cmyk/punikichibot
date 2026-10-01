@@ -31,7 +31,8 @@ RESERVE_CATEGORY_CHOICES = [
     app_commands.Choice(name="乱入", value="乱入"),
 ]
 
-CHARACTER_CODE_PATTERN = re.compile(r"^[a-z0-9]+$")
+CHARACTER_CODE_LENGTH = 8
+CHARACTER_CODE_PATTERN = re.compile(rf"^[a-z0-9]{{{CHARACTER_CODE_LENGTH}}}$")
 TIME_ONLY_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATETIME_PATTERN = re.compile(r"^(\d{1,2})/(\d{1,2})\s+([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -71,10 +72,11 @@ def _parse_reserve_time(raw: str, now: datetime) -> datetime | None:
 
 
 class OtasukeModal(discord.ui.Modal):
-    def __init__(self, cog: "OtasukeCog", battle_type: str, include_level: bool):
+    def __init__(self, cog: "OtasukeCog", battle_type: str, include_level: bool, character_code: str):
         super().__init__(title=f"おたすけ募集（{battle_type}）")
         self.cog = cog
         self.battle_type = battle_type
+        self.character_code = character_code
 
         self.level: discord.ui.TextInput | None = None
         if include_level:
@@ -86,19 +88,12 @@ class OtasukeModal(discord.ui.Modal):
             )
             self.add_item(self.level)
 
-        self.character_code = discord.ui.TextInput(
-            label="キャラクターコード",
-            placeholder="例: abcd1234（半角数字・小文字英字のみ）",
-            required=True,
-            max_length=50,
-        )
         self.details = discord.ui.TextInput(
             label="詳細情報",
             style=discord.TextStyle.paragraph,
             required=False,
             max_length=500,
         )
-        self.add_item(self.character_code)
         self.add_item(self.details)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -112,19 +107,11 @@ class OtasukeModal(discord.ui.Modal):
                 return
             level_value = int(raw_level)
 
-        code_value = str(self.character_code.value).strip()
-        if not CHARACTER_CODE_PATTERN.fullmatch(code_value):
-            await interaction.response.send_message(
-                "キャラクターコードは半角数字と小文字アルファベットのみで入力してください。",
-                ephemeral=True,
-            )
-            return
-
         await self.cog.post_recruitment(
             interaction=interaction,
             battle_type=self.battle_type,
             level=level_value,
-            character_code=code_value,
+            character_code=self.character_code,
             details=str(self.details.value) if self.details.value else None,
         )
 
@@ -138,13 +125,26 @@ class OtasukePanelView(discord.ui.View):
         label="通常で募集", style=discord.ButtonStyle.primary, custom_id="otasuke_normal_button"
     )
     async def normal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(OtasukeModal(self.cog, "通常", include_level=False))
+        await self._open_modal(interaction, "通常", include_level=False)
 
     @discord.ui.button(
         label="乱入で募集", style=discord.ButtonStyle.danger, custom_id="otasuke_intrusion_button"
     )
     async def intrusion_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(OtasukeModal(self.cog, "乱入", include_level=True))
+        await self._open_modal(interaction, "乱入", include_level=True)
+
+    async def _open_modal(self, interaction: discord.Interaction, battle_type: str, include_level: bool):
+        code = self.cog.character_codes.get(interaction.user.id)
+        if code is None:
+            await interaction.response.send_message(
+                "キャラクターコードが未登録です。`/otasuke registercode` で登録してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            OtasukeModal(self.cog, battle_type, include_level=include_level, character_code=code)
+        )
 
 
 class OtasukeCog(commands.Cog):
@@ -156,6 +156,7 @@ class OtasukeCog(commands.Cog):
         self.bot = bot
         self.role_ids: dict[int, dict[str, int]] = {}
         self.channel_ids: dict[int, dict[str, int]] = {}
+        self.character_codes: dict[int, str] = {}
         self.reservations: dict[int, dict] = {}
         self._next_reservation_id = 1
 
@@ -173,6 +174,7 @@ class OtasukeCog(commands.Cog):
         state = {
             "role_ids": {str(gid): roles for gid, roles in self.role_ids.items()},
             "channel_ids": {str(gid): chans for gid, chans in self.channel_ids.items()},
+            "character_codes": {str(uid): code for uid, code in self.character_codes.items()},
             "reservations": {
                 str(rid): {
                     "user_id": data["user_id"],
@@ -209,6 +211,9 @@ class OtasukeCog(commands.Cog):
         self.channel_ids = {
             int(gid): dict(chans) for gid, chans in state.get("channel_ids", {}).items()
         }
+        self.character_codes = {
+            int(uid): code for uid, code in state.get("character_codes", {}).items()
+        }
         self.reservations = {
             int(rid): {
                 "user_id": data["user_id"],
@@ -233,6 +238,37 @@ class OtasukeCog(commands.Cog):
         if level is not None and level <= 8:
             return "intrusion_5_8"
         return "intrusion_9_plus"
+
+    @otasuke_group.command(
+        name="registercode", description="おたすけ募集で使うキャラクターコードを登録します"
+    )
+    @app_commands.describe(code=f"キャラクターコード(半角数字・小文字英字 {CHARACTER_CODE_LENGTH}文字)")
+    async def register_code(self, interaction: discord.Interaction, code: str):
+        code_value = code.strip()
+        if not CHARACTER_CODE_PATTERN.fullmatch(code_value):
+            await interaction.response.send_message(
+                f"キャラクターコードは半角数字・小文字アルファベットのみの{CHARACTER_CODE_LENGTH}文字で入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        self.character_codes[interaction.user.id] = code_value
+        self._save_state()
+        await interaction.response.send_message(
+            f"キャラクターコードを `{code_value}` として登録しました。", ephemeral=True
+        )
+
+    @otasuke_group.command(name="mycode", description="登録済みのキャラクターコードを確認します")
+    async def my_code(self, interaction: discord.Interaction):
+        code = self.character_codes.get(interaction.user.id)
+        if code is None:
+            await interaction.response.send_message(
+                "キャラクターコードが未登録です。`/otasuke registercode` で登録してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(f"登録中のキャラクターコード: `{code}`", ephemeral=True)
 
     @otasuke_group.command(name="panel", description="おたすけ募集パネルを設置します")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -325,7 +361,6 @@ class OtasukeCog(commands.Cog):
     @app_commands.describe(
         category="種別(通常/乱入)",
         time="投稿する時刻。「21:00」または「10/05 21:00」の形式（日本時間）",
-        character_code="キャラクターコード(半角数字・小文字英字のみ)",
         level="ボスのレベル(乱入の場合は必須)",
         details="詳細情報(任意)",
     )
@@ -335,13 +370,20 @@ class OtasukeCog(commands.Cog):
         interaction: discord.Interaction,
         category: app_commands.Choice[str],
         time: str,
-        character_code: str,
         level: int | None = None,
         details: str | None = None,
     ):
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        code_value = self.character_codes.get(interaction.user.id)
+        if code_value is None:
+            await interaction.response.send_message(
+                "キャラクターコードが未登録です。`/otasuke registercode` で登録してください。",
+                ephemeral=True,
+            )
             return
 
         battle_type = category.value
@@ -355,14 +397,6 @@ class OtasukeCog(commands.Cog):
         if level is not None and level < 1:
             await interaction.response.send_message(
                 "レベルは1以上の数字で指定してください。", ephemeral=True
-            )
-            return
-
-        code_value = character_code.strip()
-        if not CHARACTER_CODE_PATTERN.fullmatch(code_value):
-            await interaction.response.send_message(
-                "キャラクターコードは半角数字と小文字アルファベットのみで入力してください。",
-                ephemeral=True,
             )
             return
 
