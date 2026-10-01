@@ -17,13 +17,6 @@ CATEGORY_CHOICES = [
     app_commands.Choice(name="乱入（LV9〜）", value="intrusion_9_plus"),
 ]
 
-CATEGORY_LABELS = {
-    "normal": "通常",
-    "intrusion_1_4": "乱入（LV1〜4）",
-    "intrusion_5_8": "乱入（LV5〜8）",
-    "intrusion_9_plus": "乱入（LV9〜）",
-}
-
 CATEGORY_CHANNEL_NAMES = {
     "normal": "おたすけ-通常",
     "intrusion_1_4": "おたすけ-乱入lv1-4",
@@ -489,7 +482,6 @@ class OtasukeCog(commands.Cog):
         fallback_channel: discord.abc.Messageable | None,
     ) -> bool:
         category_key = self._category_key(battle_type, level)
-        category_label = CATEGORY_LABELS[category_key]
 
         channel_id = self.channel_ids.get(guild.id, {}).get(category_key)
         channel = self.bot.get_channel(channel_id) if channel_id else fallback_channel
@@ -501,7 +493,6 @@ class OtasukeCog(commands.Cog):
             title="🆘 おたすけ募集",
             color=discord.Color.orange() if battle_type == "乱入" else discord.Color.blue(),
         )
-        embed.add_field(name="種別", value=category_label, inline=True)
         if level is not None:
             embed.add_field(name="レベル", value=f"LV{level}", inline=True)
         embed.add_field(name="キャラクターコード", value=f"`{character_code}`", inline=True)
