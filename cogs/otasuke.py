@@ -1,6 +1,9 @@
 import asyncio
+import json
+import os
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import discord
@@ -40,6 +43,8 @@ TIME_ONLY_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATETIME_PATTERN = re.compile(r"^(\d{1,2})/(\d{1,2})\s+([01]?\d|2[0-3]):([0-5]\d)$")
 
 JST = ZoneInfo("Asia/Tokyo")
+
+DATA_PATH = Path(os.getenv("OTASUKE_DATA_PATH", "data/otasuke_state.json"))
 
 
 def _parse_reserve_time(raw: str, now: datetime) -> datetime | None:
@@ -161,6 +166,71 @@ class OtasukeCog(commands.Cog):
         self.reservations: dict[int, dict] = {}
         self._next_reservation_id = 1
 
+    async def cog_load(self):
+        self._load_state()
+
+        now = datetime.now(JST)
+        for reservation_id, data in list(self.reservations.items()):
+            delay_seconds = max((data["scheduled_at"] - now).total_seconds(), 0)
+            data["task"] = asyncio.create_task(
+                self._fire_reservation(reservation_id, delay_seconds)
+            )
+
+    def _save_state(self) -> None:
+        state = {
+            "role_ids": {str(gid): roles for gid, roles in self.role_ids.items()},
+            "channel_ids": {str(gid): chans for gid, chans in self.channel_ids.items()},
+            "reservations": {
+                str(rid): {
+                    "user_id": data["user_id"],
+                    "guild_id": data["guild_id"],
+                    "channel_id": data["channel_id"],
+                    "battle_type": data["battle_type"],
+                    "level": data["level"],
+                    "character_code": data["character_code"],
+                    "details": data["details"],
+                    "scheduled_at": data["scheduled_at"].isoformat(),
+                }
+                for rid, data in self.reservations.items()
+            },
+            "next_reservation_id": self._next_reservation_id,
+        }
+
+        DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = DATA_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(DATA_PATH)
+
+    def _load_state(self) -> None:
+        if not DATA_PATH.exists():
+            return
+
+        try:
+            state = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        self.role_ids = {
+            int(gid): dict(roles) for gid, roles in state.get("role_ids", {}).items()
+        }
+        self.channel_ids = {
+            int(gid): dict(chans) for gid, chans in state.get("channel_ids", {}).items()
+        }
+        self.reservations = {
+            int(rid): {
+                "user_id": data["user_id"],
+                "guild_id": data["guild_id"],
+                "channel_id": data["channel_id"],
+                "battle_type": data["battle_type"],
+                "level": data["level"],
+                "character_code": data["character_code"],
+                "details": data["details"],
+                "scheduled_at": datetime.fromisoformat(data["scheduled_at"]),
+            }
+            for rid, data in state.get("reservations", {}).items()
+        }
+        self._next_reservation_id = state.get("next_reservation_id", 1)
+
     @staticmethod
     def _category_key(battle_type: str, level: int | None) -> str:
         if battle_type == "通常":
@@ -189,6 +259,7 @@ class OtasukeCog(commands.Cog):
         self, interaction: discord.Interaction, category: app_commands.Choice[str], role: discord.Role
     ):
         self.role_ids.setdefault(interaction.guild_id, {})[category.value] = role.id
+        self._save_state()
         await interaction.response.send_message(
             f"「{category.name}」の募集時に {role.mention} にメンションするよう設定しました。",
             ephemeral=True,
@@ -205,6 +276,7 @@ class OtasukeCog(commands.Cog):
         channel: discord.TextChannel,
     ):
         self.channel_ids.setdefault(interaction.guild_id, {})[category.value] = channel.id
+        self._save_state()
         await interaction.response.send_message(
             f"「{category.name}」の募集の投稿先を {channel.mention} に設定しました。",
             ephemeral=True,
@@ -245,6 +317,8 @@ class OtasukeCog(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        self._save_state()
 
         lines = [f"カテゴリ「{category.name}」にチャンネルを同期しました。"]
         if created:
@@ -313,27 +387,20 @@ class OtasukeCog(commands.Cog):
         reservation_id = self._next_reservation_id
         self._next_reservation_id += 1
 
-        task = asyncio.create_task(
-            self._fire_reservation(
-                reservation_id=reservation_id,
-                guild_id=guild.id,
-                user_id=interaction.user.id,
-                user_mention=interaction.user.mention,
-                channel_id=interaction.channel_id,
-                battle_type=battle_type,
-                level=level if battle_type == "乱入" else None,
-                character_code=code_value,
-                details=details,
-                delay_seconds=delay_seconds,
-            )
-        )
         self.reservations[reservation_id] = {
-            "task": task,
             "user_id": interaction.user.id,
-            "scheduled_at": scheduled_at,
+            "guild_id": guild.id,
+            "channel_id": interaction.channel_id,
             "battle_type": battle_type,
             "level": level if battle_type == "乱入" else None,
+            "character_code": code_value,
+            "details": details,
+            "scheduled_at": scheduled_at,
         }
+        self.reservations[reservation_id]["task"] = asyncio.create_task(
+            self._fire_reservation(reservation_id, delay_seconds)
+        )
+        self._save_state()
 
         await interaction.response.send_message(
             f"予約を受け付けました（ID: {reservation_id}）。"
@@ -373,48 +440,40 @@ class OtasukeCog(commands.Cog):
 
         reservation["task"].cancel()
         self.reservations.pop(reservation_id, None)
+        self._save_state()
         await interaction.response.send_message(
             f"予約（ID: {reservation_id}）を取り消しました。", ephemeral=True
         )
 
-    async def _fire_reservation(
-        self,
-        reservation_id: int,
-        guild_id: int,
-        user_id: int,
-        user_mention: str,
-        channel_id: int,
-        battle_type: str,
-        level: int | None,
-        character_code: str,
-        details: str | None,
-        delay_seconds: float,
-    ):
+    async def _fire_reservation(self, reservation_id: int, delay_seconds: float):
         try:
             await asyncio.sleep(delay_seconds)
         except asyncio.CancelledError:
             return
 
-        self.reservations.pop(reservation_id, None)
+        data = self.reservations.pop(reservation_id, None)
+        self._save_state()
+        if data is None:
+            return
 
-        guild = self.bot.get_guild(guild_id)
+        guild = self.bot.get_guild(data["guild_id"])
         if guild is None:
             return
 
-        fallback_channel = self.bot.get_channel(channel_id)
+        fallback_channel = self.bot.get_channel(data["channel_id"])
         sent = await self._send_recruitment(
             guild=guild,
-            author_mention=user_mention,
-            battle_type=battle_type,
-            level=level,
-            character_code=character_code,
-            details=details,
+            author_mention=f"<@{data['user_id']}>",
+            battle_type=data["battle_type"],
+            level=data["level"],
+            character_code=data["character_code"],
+            details=data["details"],
             fallback_channel=fallback_channel,
         )
         if not sent and fallback_channel is not None:
             try:
                 await fallback_channel.send(
-                    f"<@{user_id}> 予約投稿に失敗しました。投稿先チャンネルの設定を確認してください。"
+                    f"<@{data['user_id']}> 予約投稿に失敗しました。投稿先チャンネルの設定を確認してください。"
                 )
             except discord.HTTPException:
                 pass
