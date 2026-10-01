@@ -147,6 +147,35 @@ class OtasukePanelView(discord.ui.View):
         )
 
 
+class CodeChangeApprovalView(discord.ui.View):
+    def __init__(self, cog: "OtasukeCog", request_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.request_id = request_id
+
+        approve = discord.ui.Button(
+            label="承認",
+            style=discord.ButtonStyle.success,
+            custom_id=f"otasuke_code_approve_{request_id}",
+        )
+        approve.callback = self._approve
+        self.add_item(approve)
+
+        reject = discord.ui.Button(
+            label="却下",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"otasuke_code_reject_{request_id}",
+        )
+        reject.callback = self._reject
+        self.add_item(reject)
+
+    async def _approve(self, interaction: discord.Interaction):
+        await self.cog.resolve_code_change(interaction, self.request_id, approve=True)
+
+    async def _reject(self, interaction: discord.Interaction):
+        await self.cog.resolve_code_change(interaction, self.request_id, approve=False)
+
+
 class OtasukeCog(commands.Cog):
     """おたすけ募集機能"""
 
@@ -157,8 +186,11 @@ class OtasukeCog(commands.Cog):
         self.role_ids: dict[int, dict[str, int]] = {}
         self.channel_ids: dict[int, dict[str, int]] = {}
         self.character_codes: dict[int, str] = {}
+        self.approval_role_ids: dict[int, int] = {}
+        self.pending_code_changes: dict[int, dict] = {}
         self.reservations: dict[int, dict] = {}
         self._next_reservation_id = 1
+        self._next_request_id = 1
 
     async def cog_load(self):
         self._load_state()
@@ -170,11 +202,20 @@ class OtasukeCog(commands.Cog):
                 self._fire_reservation(reservation_id, delay_seconds)
             )
 
+        for request_id, data in self.pending_code_changes.items():
+            self.bot.add_view(
+                CodeChangeApprovalView(self, request_id), message_id=data["message_id"]
+            )
+
     def _save_state(self) -> None:
         state = {
             "role_ids": {str(gid): roles for gid, roles in self.role_ids.items()},
             "channel_ids": {str(gid): chans for gid, chans in self.channel_ids.items()},
             "character_codes": {str(uid): code for uid, code in self.character_codes.items()},
+            "approval_role_ids": {str(gid): rid for gid, rid in self.approval_role_ids.items()},
+            "pending_code_changes": {
+                str(rid): data for rid, data in self.pending_code_changes.items()
+            },
             "reservations": {
                 str(rid): {
                     "user_id": data["user_id"],
@@ -189,6 +230,7 @@ class OtasukeCog(commands.Cog):
                 for rid, data in self.reservations.items()
             },
             "next_reservation_id": self._next_reservation_id,
+            "next_request_id": self._next_request_id,
         }
 
         DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +256,12 @@ class OtasukeCog(commands.Cog):
         self.character_codes = {
             int(uid): code for uid, code in state.get("character_codes", {}).items()
         }
+        self.approval_role_ids = {
+            int(gid): rid for gid, rid in state.get("approval_role_ids", {}).items()
+        }
+        self.pending_code_changes = {
+            int(rid): data for rid, data in state.get("pending_code_changes", {}).items()
+        }
         self.reservations = {
             int(rid): {
                 "user_id": data["user_id"],
@@ -228,6 +276,7 @@ class OtasukeCog(commands.Cog):
             for rid, data in state.get("reservations", {}).items()
         }
         self._next_reservation_id = state.get("next_reservation_id", 1)
+        self._next_request_id = state.get("next_request_id", 1)
 
     @staticmethod
     def _category_key(battle_type: str, level: int | None) -> str:
@@ -244,6 +293,10 @@ class OtasukeCog(commands.Cog):
     )
     @app_commands.describe(code=f"キャラクターコード(半角数字・小文字英字 {CHARACTER_CODE_LENGTH}文字)")
     async def register_code(self, interaction: discord.Interaction, code: str):
+        if interaction.guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
         code_value = code.strip()
         if not CHARACTER_CODE_PATTERN.fullmatch(code_value):
             await interaction.response.send_message(
@@ -252,11 +305,165 @@ class OtasukeCog(commands.Cog):
             )
             return
 
-        self.character_codes[interaction.user.id] = code_value
+        existing_code = self.character_codes.get(interaction.user.id)
+
+        if existing_code is None:
+            self.character_codes[interaction.user.id] = code_value
+            self._save_state()
+            await interaction.response.send_message(
+                f"キャラクターコードを `{code_value}` として登録しました。", ephemeral=True
+            )
+            return
+
+        if existing_code == code_value:
+            await interaction.response.send_message(
+                "すでに同じキャラクターコードが登録されています。", ephemeral=True
+            )
+            return
+
+        await self._request_code_change(interaction, existing_code, code_value)
+
+    @otasuke_group.command(
+        name="setapprovalrole",
+        description="キャラクターコードの変更申請を承認できるロールを設定します",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(role="承認ロール")
+    async def set_approval_role(self, interaction: discord.Interaction, role: discord.Role):
+        self.approval_role_ids[interaction.guild_id] = role.id
         self._save_state()
         await interaction.response.send_message(
-            f"キャラクターコードを `{code_value}` として登録しました。", ephemeral=True
+            f"キャラクターコードの変更申請の承認ロールを {role.mention} に設定しました。",
+            ephemeral=True,
         )
+
+    async def _request_code_change(
+        self, interaction: discord.Interaction, old_code: str, new_code: str
+    ):
+        guild = interaction.guild
+        role_id = self.approval_role_ids.get(guild.id)
+        role = guild.get_role(role_id) if role_id else None
+        if role is None:
+            await interaction.response.send_message(
+                "キャラクターコードの変更申請を受け付ける承認ロールが未設定です。"
+                "管理者に `/otasuke setapprovalrole` の設定を依頼してください。",
+                ephemeral=True,
+            )
+            return
+
+        await self._cancel_pending_requests_for_user(interaction.user.id)
+
+        request_id = self._next_request_id
+        self._next_request_id += 1
+
+        embed = discord.Embed(
+            title="📝 キャラクターコード変更申請",
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="申請者", value=interaction.user.mention, inline=True)
+        embed.add_field(name="現在のコード", value=f"`{old_code}`", inline=True)
+        embed.add_field(name="変更後のコード", value=f"`{new_code}`", inline=True)
+
+        message = await interaction.channel.send(
+            content=role.mention,
+            embed=embed,
+            view=CodeChangeApprovalView(self, request_id),
+        )
+
+        self.pending_code_changes[request_id] = {
+            "user_id": interaction.user.id,
+            "guild_id": guild.id,
+            "channel_id": interaction.channel_id,
+            "message_id": message.id,
+            "old_code": old_code,
+            "new_code": new_code,
+        }
+        self._save_state()
+
+        await interaction.response.send_message(
+            "キャラクターコードの変更申請を送信しました。承認されるまでお待ちください。",
+            ephemeral=True,
+        )
+
+    async def _cancel_pending_requests_for_user(self, user_id: int) -> None:
+        stale_ids = [
+            rid for rid, data in self.pending_code_changes.items() if data["user_id"] == user_id
+        ]
+        for rid in stale_ids:
+            data = self.pending_code_changes.pop(rid, None)
+            if data is None:
+                continue
+            channel = self.bot.get_channel(data["channel_id"])
+            if channel is None:
+                continue
+            try:
+                message = await channel.fetch_message(data["message_id"])
+                await message.edit(
+                    content="この変更申請は新しい申請により自動的にキャンセルされました。",
+                    embed=None,
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def resolve_code_change(
+        self, interaction: discord.Interaction, request_id: int, approve: bool
+    ):
+        request = self.pending_code_changes.get(request_id)
+        if request is None:
+            await interaction.response.send_message(
+                "この申請はすでに処理済みか、見つかりませんでした。", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None or guild.id != request["guild_id"]:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        role_id = self.approval_role_ids.get(guild.id)
+        member = interaction.user
+        has_permission = isinstance(member, discord.Member) and (
+            member.guild_permissions.manage_guild
+            or (role_id is not None and any(r.id == role_id for r in member.roles))
+        )
+        if not has_permission:
+            await interaction.response.send_message("この操作を行う権限がありません。", ephemeral=True)
+            return
+
+        self.pending_code_changes.pop(request_id, None)
+
+        if approve:
+            self.character_codes[request["user_id"]] = request["new_code"]
+
+        self._save_state()
+
+        result_text = "✅ 承認されました" if approve else "❌ 却下されました"
+        embed = discord.Embed(
+            title="📝 キャラクターコード変更申請",
+            color=discord.Color.green() if approve else discord.Color.red(),
+        )
+        embed.add_field(name="申請者", value=f"<@{request['user_id']}>", inline=True)
+        embed.add_field(name="現在のコード", value=f"`{request['old_code']}`", inline=True)
+        embed.add_field(name="変更後のコード", value=f"`{request['new_code']}`", inline=True)
+        embed.add_field(
+            name="結果", value=f"{result_text}（対応者: {interaction.user.mention}）", inline=False
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+        requester = guild.get_member(request["user_id"])
+        try:
+            if requester is None:
+                requester = await self.bot.fetch_user(request["user_id"])
+            if approve:
+                await requester.send(
+                    f"キャラクターコードの変更申請が承認され、`{request['new_code']}` に更新されました。"
+                )
+            else:
+                await requester.send("キャラクターコードの変更申請は却下されました。")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     @otasuke_group.command(name="mycode", description="登録済みのキャラクターコードを確認します")
     async def my_code(self, interaction: discord.Interaction):
