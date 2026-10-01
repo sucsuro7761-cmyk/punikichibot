@@ -1,4 +1,7 @@
+import asyncio
 import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -27,7 +30,46 @@ CATEGORY_CHANNEL_NAMES = {
 
 SYNC_CATEGORY_NAME = "おたすけ募集"
 
+RESERVE_CATEGORY_CHOICES = [
+    app_commands.Choice(name="通常", value="通常"),
+    app_commands.Choice(name="乱入", value="乱入"),
+]
+
 CHARACTER_CODE_PATTERN = re.compile(r"^[a-z0-9]+$")
+TIME_ONLY_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+DATETIME_PATTERN = re.compile(r"^(\d{1,2})/(\d{1,2})\s+([01]?\d|2[0-3]):([0-5]\d)$")
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def _parse_reserve_time(raw: str, now: datetime) -> datetime | None:
+    raw = raw.strip()
+
+    match = TIME_ONLY_PATTERN.fullmatch(raw)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    match = DATETIME_PATTERN.fullmatch(raw)
+    if match:
+        month, day, hour, minute = (int(g) for g in match.groups())
+        try:
+            candidate = now.replace(
+                month=month, day=day, hour=hour, minute=minute, second=0, microsecond=0
+            )
+        except ValueError:
+            return None
+        if candidate <= now:
+            try:
+                candidate = candidate.replace(year=candidate.year + 1)
+            except ValueError:
+                return None
+        return candidate
+
+    return None
 
 
 class OtasukeModal(discord.ui.Modal):
@@ -116,6 +158,8 @@ class OtasukeCog(commands.Cog):
         self.bot = bot
         self.role_ids: dict[int, dict[str, int]] = {}
         self.channel_ids: dict[int, dict[str, int]] = {}
+        self.reservations: dict[int, dict] = {}
+        self._next_reservation_id = 1
 
     @staticmethod
     def _category_key(battle_type: str, level: int | None) -> str:
@@ -210,27 +254,189 @@ class OtasukeCog(commands.Cog):
 
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    async def post_recruitment(
+    @otasuke_group.command(name="reserve", description="指定した日時に自動でおたすけ募集を投稿します")
+    @app_commands.describe(
+        category="種別(通常/乱入)",
+        time="投稿する時刻。「21:00」または「10/05 21:00」の形式（日本時間）",
+        character_code="キャラクターコード(半角数字・小文字英字のみ)",
+        level="ボスのレベル(乱入の場合は必須)",
+        details="詳細情報(任意)",
+    )
+    @app_commands.choices(category=RESERVE_CATEGORY_CHOICES)
+    async def reserve(
         self,
         interaction: discord.Interaction,
+        category: app_commands.Choice[str],
+        time: str,
+        character_code: str,
+        level: int | None = None,
+        details: str | None = None,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        battle_type = category.value
+
+        if battle_type == "乱入" and level is None:
+            await interaction.response.send_message(
+                "乱入の場合はレベルを指定してください。", ephemeral=True
+            )
+            return
+
+        if level is not None and level < 1:
+            await interaction.response.send_message(
+                "レベルは1以上の数字で指定してください。", ephemeral=True
+            )
+            return
+
+        code_value = character_code.strip()
+        if not CHARACTER_CODE_PATTERN.fullmatch(code_value):
+            await interaction.response.send_message(
+                "キャラクターコードは半角数字と小文字アルファベットのみで入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        now = datetime.now(JST)
+        scheduled_at = _parse_reserve_time(time, now)
+        if scheduled_at is None:
+            await interaction.response.send_message(
+                "時刻の形式が正しくありません。「21:00」または「10/05 21:00」の形式で指定してください。",
+                ephemeral=True,
+            )
+            return
+
+        delay_seconds = (scheduled_at - now).total_seconds()
+
+        reservation_id = self._next_reservation_id
+        self._next_reservation_id += 1
+
+        task = asyncio.create_task(
+            self._fire_reservation(
+                reservation_id=reservation_id,
+                guild_id=guild.id,
+                user_id=interaction.user.id,
+                user_mention=interaction.user.mention,
+                channel_id=interaction.channel_id,
+                battle_type=battle_type,
+                level=level if battle_type == "乱入" else None,
+                character_code=code_value,
+                details=details,
+                delay_seconds=delay_seconds,
+            )
+        )
+        self.reservations[reservation_id] = {
+            "task": task,
+            "user_id": interaction.user.id,
+            "scheduled_at": scheduled_at,
+            "battle_type": battle_type,
+            "level": level if battle_type == "乱入" else None,
+        }
+
+        await interaction.response.send_message(
+            f"予約を受け付けました（ID: {reservation_id}）。"
+            f"{scheduled_at.strftime('%m/%d %H:%M')} 頃に自動投稿します（日本時間）。",
+            ephemeral=True,
+        )
+
+    @otasuke_group.command(name="reservations", description="自分が予約したおたすけ募集の一覧を確認します")
+    async def list_reservations(self, interaction: discord.Interaction):
+        mine = [
+            (rid, r) for rid, r in self.reservations.items() if r["user_id"] == interaction.user.id
+        ]
+        if not mine:
+            await interaction.response.send_message("予約中の募集はありません。", ephemeral=True)
+            return
+
+        mine.sort(key=lambda item: item[1]["scheduled_at"])
+        lines = []
+        for rid, item in mine:
+            level_part = f"（LV{item['level']}）" if item["level"] is not None else ""
+            lines.append(
+                f"- ID {rid}: {item['battle_type']}{level_part} / "
+                f"{item['scheduled_at'].strftime('%m/%d %H:%M')}"
+            )
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @otasuke_group.command(name="cancelreserve", description="予約したおたすけ募集を取り消します")
+    @app_commands.describe(reservation_id="取り消す予約のID(/otasuke reservations で確認できます)")
+    async def cancel_reserve(self, interaction: discord.Interaction, reservation_id: int):
+        reservation = self.reservations.get(reservation_id)
+        if reservation is None or reservation["user_id"] != interaction.user.id:
+            await interaction.response.send_message(
+                "指定されたIDの予約が見つかりません。", ephemeral=True
+            )
+            return
+
+        reservation["task"].cancel()
+        self.reservations.pop(reservation_id, None)
+        await interaction.response.send_message(
+            f"予約（ID: {reservation_id}）を取り消しました。", ephemeral=True
+        )
+
+    async def _fire_reservation(
+        self,
+        reservation_id: int,
+        guild_id: int,
+        user_id: int,
+        user_mention: str,
+        channel_id: int,
         battle_type: str,
         level: int | None,
         character_code: str,
         details: str | None,
+        delay_seconds: float,
     ):
-        guild_id = interaction.guild_id
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+
+        self.reservations.pop(reservation_id, None)
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        fallback_channel = self.bot.get_channel(channel_id)
+        sent = await self._send_recruitment(
+            guild=guild,
+            author_mention=user_mention,
+            battle_type=battle_type,
+            level=level,
+            character_code=character_code,
+            details=details,
+            fallback_channel=fallback_channel,
+        )
+        if not sent and fallback_channel is not None:
+            try:
+                await fallback_channel.send(
+                    f"<@{user_id}> 予約投稿に失敗しました。投稿先チャンネルの設定を確認してください。"
+                )
+            except discord.HTTPException:
+                pass
+
+    async def _send_recruitment(
+        self,
+        guild: discord.Guild,
+        author_mention: str,
+        battle_type: str,
+        level: int | None,
+        character_code: str,
+        details: str | None,
+        fallback_channel: discord.abc.Messageable | None,
+    ) -> bool:
         category_key = self._category_key(battle_type, level)
         category_label = CATEGORY_LABELS[category_key]
 
-        channel_id = self.channel_ids.get(guild_id, {}).get(category_key)
-        channel = self.bot.get_channel(channel_id) if channel_id else interaction.channel
+        channel_id = self.channel_ids.get(guild.id, {}).get(category_key)
+        channel = self.bot.get_channel(channel_id) if channel_id else fallback_channel
 
         if channel is None:
-            await interaction.response.send_message(
-                "投稿先チャンネルが見つかりません。`/otasuke setchannel` または `/otasuke sync` で設定してください。",
-                ephemeral=True,
-            )
-            return
+            return False
 
         embed = discord.Embed(
             title="🆘 おたすけ募集",
@@ -240,17 +446,49 @@ class OtasukeCog(commands.Cog):
         if level is not None:
             embed.add_field(name="レベル", value=f"LV{level}", inline=True)
         embed.add_field(name="キャラクターコード", value=f"`{character_code}`", inline=True)
-        embed.add_field(name="募集者", value=interaction.user.mention, inline=True)
+        embed.add_field(name="募集者", value=author_mention, inline=True)
         embed.add_field(name="詳細情報", value=details or "-", inline=False)
 
-        role_id = self.role_ids.get(guild_id, {}).get(category_key)
+        role_id = self.role_ids.get(guild.id, {}).get(category_key)
         content = None
-        if role_id and interaction.guild is not None:
-            role = interaction.guild.get_role(role_id)
+        if role_id:
+            role = guild.get_role(role_id)
             if role:
                 content = role.mention
 
         await channel.send(content=content, embed=embed)
+        return True
+
+    async def post_recruitment(
+        self,
+        interaction: discord.Interaction,
+        battle_type: str,
+        level: int | None,
+        character_code: str,
+        details: str | None,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        sent = await self._send_recruitment(
+            guild=guild,
+            author_mention=interaction.user.mention,
+            battle_type=battle_type,
+            level=level,
+            character_code=character_code,
+            details=details,
+            fallback_channel=interaction.channel,
+        )
+
+        if not sent:
+            await interaction.response.send_message(
+                "投稿先チャンネルが見つかりません。`/otasuke setchannel` または `/otasuke sync` で設定してください。",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.send_message("募集を投稿しました！", ephemeral=True)
 
 
