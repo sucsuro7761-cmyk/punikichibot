@@ -147,6 +147,90 @@ class OtasukePanelView(discord.ui.View):
         )
 
 
+class ReserveModal(discord.ui.Modal):
+    def __init__(self, cog: "OtasukeCog", battle_type: str, include_level: bool):
+        super().__init__(title=f"おたすけ予約（{battle_type}）")
+        self.cog = cog
+        self.battle_type = battle_type
+
+        self.time_input = discord.ui.TextInput(
+            label="投稿時刻",
+            placeholder="例: 21:00 または 10/05 21:00（日本時間）",
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.time_input)
+
+        self.level: discord.ui.TextInput | None = None
+        if include_level:
+            self.level = discord.ui.TextInput(
+                label="ボスのレベル",
+                placeholder="例: 12",
+                required=True,
+                max_length=3,
+            )
+            self.add_item(self.level)
+
+        self.details = discord.ui.TextInput(
+            label="詳細情報",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.details)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        level_value = None
+        if self.level is not None:
+            raw_level = str(self.level.value).strip()
+            if not raw_level.isdigit() or int(raw_level) < 1:
+                await interaction.response.send_message(
+                    "レベルは1以上の数字で入力してください。", ephemeral=True
+                )
+                return
+            level_value = int(raw_level)
+
+        await self.cog.create_reservation(
+            interaction=interaction,
+            battle_type=self.battle_type,
+            time_str=str(self.time_input.value).strip(),
+            level=level_value,
+            details=str(self.details.value) if self.details.value else None,
+        )
+
+
+class ReservePanelView(discord.ui.View):
+    def __init__(self, cog: "OtasukeCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="通常を予約", style=discord.ButtonStyle.primary, custom_id="otasuke_reserve_normal_button"
+    )
+    async def normal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_modal(interaction, "通常", include_level=False)
+
+    @discord.ui.button(
+        label="乱入を予約",
+        style=discord.ButtonStyle.danger,
+        custom_id="otasuke_reserve_intrusion_button",
+    )
+    async def intrusion_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_modal(interaction, "乱入", include_level=True)
+
+    async def _open_modal(self, interaction: discord.Interaction, battle_type: str, include_level: bool):
+        if self.cog.character_codes.get(interaction.user.id) is None:
+            await interaction.response.send_message(
+                "キャラクターコードが未登録です。`/otasuke registercode` で登録してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            ReserveModal(self.cog, battle_type, include_level=include_level)
+        )
+
+
 class CodeChangeApprovalView(discord.ui.View):
     def __init__(self, cog: "OtasukeCog", request_id: int):
         super().__init__(timeout=None)
@@ -536,6 +620,16 @@ class OtasukeCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, view=OtasukePanelView(self))
 
+    @otasuke_group.command(name="reservepanel", description="おたすけ予約専用パネルを設置します")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def reserve_panel(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="🗓️ おたすけ予約",
+            description="ボタンを押して予約内容を入力してください。指定した日時になったら自動で募集を投稿します。",
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(embed=embed, view=ReservePanelView(self))
+
     @otasuke_group.command(name="setrole", description="種別ごとに募集時のメンションロールを設定します")
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(category="設定する種別", role="メンションするロール")
@@ -629,6 +723,22 @@ class OtasukeCog(commands.Cog):
         level: int | None = None,
         details: str | None = None,
     ):
+        await self.create_reservation(
+            interaction=interaction,
+            battle_type=category.value,
+            time_str=time,
+            level=level,
+            details=details,
+        )
+
+    async def create_reservation(
+        self,
+        interaction: discord.Interaction,
+        battle_type: str,
+        time_str: str,
+        level: int | None,
+        details: str | None,
+    ):
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
@@ -641,8 +751,6 @@ class OtasukeCog(commands.Cog):
                 ephemeral=True,
             )
             return
-
-        battle_type = category.value
 
         if battle_type == "乱入" and level is None:
             await interaction.response.send_message(
@@ -657,7 +765,7 @@ class OtasukeCog(commands.Cog):
             return
 
         now = datetime.now(JST)
-        scheduled_at = _parse_reserve_time(time, now)
+        scheduled_at = _parse_reserve_time(time_str, now)
         if scheduled_at is None:
             await interaction.response.send_message(
                 "時刻の形式が正しくありません。「21:00」または「10/05 21:00」の形式で指定してください。",
@@ -836,3 +944,4 @@ async def setup(bot: commands.Bot):
     cog = OtasukeCog(bot)
     await bot.add_cog(cog)
     bot.add_view(OtasukePanelView(cog))
+    bot.add_view(ReservePanelView(cog))
