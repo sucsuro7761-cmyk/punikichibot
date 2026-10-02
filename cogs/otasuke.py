@@ -187,6 +187,7 @@ class OtasukeCog(commands.Cog):
         self.channel_ids: dict[int, dict[str, int]] = {}
         self.character_codes: dict[int, str] = {}
         self.approval_role_ids: dict[int, int] = {}
+        self.approval_channel_ids: dict[int, int] = {}
         self.pending_code_changes: dict[int, dict] = {}
         self.reservations: dict[int, dict] = {}
         self._next_reservation_id = 1
@@ -213,6 +214,9 @@ class OtasukeCog(commands.Cog):
             "channel_ids": {str(gid): chans for gid, chans in self.channel_ids.items()},
             "character_codes": {str(uid): code for uid, code in self.character_codes.items()},
             "approval_role_ids": {str(gid): rid for gid, rid in self.approval_role_ids.items()},
+            "approval_channel_ids": {
+                str(gid): cid for gid, cid in self.approval_channel_ids.items()
+            },
             "pending_code_changes": {
                 str(rid): data for rid, data in self.pending_code_changes.items()
             },
@@ -259,6 +263,9 @@ class OtasukeCog(commands.Cog):
         self.approval_role_ids = {
             int(gid): rid for gid, rid in state.get("approval_role_ids", {}).items()
         }
+        self.approval_channel_ids = {
+            int(gid): cid for gid, cid in state.get("approval_channel_ids", {}).items()
+        }
         self.pending_code_changes = {
             int(rid): data for rid, data in state.get("pending_code_changes", {}).items()
         }
@@ -291,8 +298,13 @@ class OtasukeCog(commands.Cog):
     @otasuke_group.command(
         name="registercode", description="おたすけ募集で使うキャラクターコードを登録します"
     )
-    @app_commands.describe(code=f"キャラクターコード(半角数字・小文字英字 {CHARACTER_CODE_LENGTH}文字)")
-    async def register_code(self, interaction: discord.Interaction, code: str):
+    @app_commands.describe(
+        code=f"キャラクターコード(半角数字・小文字英字 {CHARACTER_CODE_LENGTH}文字)",
+        reason="変更理由(2回目以降の変更時は必須)",
+    )
+    async def register_code(
+        self, interaction: discord.Interaction, code: str, reason: str | None = None
+    ):
         if interaction.guild is None:
             await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
             return
@@ -321,7 +333,15 @@ class OtasukeCog(commands.Cog):
             )
             return
 
-        await self._request_code_change(interaction, existing_code, code_value)
+        reason_value = reason.strip() if reason else ""
+        if not reason_value:
+            await interaction.response.send_message(
+                "キャラクターコードの変更には理由の入力が必要です。`reason` を指定してください。",
+                ephemeral=True,
+            )
+            return
+
+        await self._request_code_change(interaction, existing_code, code_value, reason_value)
 
     @otasuke_group.command(
         name="setapprovalrole",
@@ -337,8 +357,24 @@ class OtasukeCog(commands.Cog):
             ephemeral=True,
         )
 
+    @otasuke_group.command(
+        name="setapprovalchannel",
+        description="キャラクターコードの変更申請の送信先チャンネルを設定します",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(channel="送信先チャンネル")
+    async def set_approval_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel
+    ):
+        self.approval_channel_ids[interaction.guild_id] = channel.id
+        self._save_state()
+        await interaction.response.send_message(
+            f"キャラクターコードの変更申請の送信先を {channel.mention} に設定しました。",
+            ephemeral=True,
+        )
+
     async def _request_code_change(
-        self, interaction: discord.Interaction, old_code: str, new_code: str
+        self, interaction: discord.Interaction, old_code: str, new_code: str, reason: str
     ):
         guild = interaction.guild
         role_id = self.approval_role_ids.get(guild.id)
@@ -347,6 +383,16 @@ class OtasukeCog(commands.Cog):
             await interaction.response.send_message(
                 "キャラクターコードの変更申請を受け付ける承認ロールが未設定です。"
                 "管理者に `/otasuke setapprovalrole` の設定を依頼してください。",
+                ephemeral=True,
+            )
+            return
+
+        channel_id = self.approval_channel_ids.get(guild.id)
+        channel = self.bot.get_channel(channel_id) if channel_id else interaction.channel
+        if channel is None:
+            await interaction.response.send_message(
+                "変更申請の送信先チャンネルが見つかりません。"
+                "管理者に `/otasuke setapprovalchannel` の設定を依頼してください。",
                 ephemeral=True,
             )
             return
@@ -363,8 +409,9 @@ class OtasukeCog(commands.Cog):
         embed.add_field(name="申請者", value=interaction.user.mention, inline=True)
         embed.add_field(name="現在のコード", value=f"`{old_code}`", inline=True)
         embed.add_field(name="変更後のコード", value=f"`{new_code}`", inline=True)
+        embed.add_field(name="変更理由", value=reason, inline=False)
 
-        message = await interaction.channel.send(
+        message = await channel.send(
             content=role.mention,
             embed=embed,
             view=CodeChangeApprovalView(self, request_id),
@@ -373,15 +420,16 @@ class OtasukeCog(commands.Cog):
         self.pending_code_changes[request_id] = {
             "user_id": interaction.user.id,
             "guild_id": guild.id,
-            "channel_id": interaction.channel_id,
+            "channel_id": channel.id,
             "message_id": message.id,
             "old_code": old_code,
             "new_code": new_code,
+            "reason": reason,
         }
         self._save_state()
 
         await interaction.response.send_message(
-            "キャラクターコードの変更申請を送信しました。承認されるまでお待ちください。",
+            f"キャラクターコードの変更申請を {channel.mention} に送信しました。承認されるまでお待ちください。",
             ephemeral=True,
         )
 
@@ -446,6 +494,7 @@ class OtasukeCog(commands.Cog):
         embed.add_field(name="申請者", value=f"<@{request['user_id']}>", inline=True)
         embed.add_field(name="現在のコード", value=f"`{request['old_code']}`", inline=True)
         embed.add_field(name="変更後のコード", value=f"`{request['new_code']}`", inline=True)
+        embed.add_field(name="変更理由", value=request.get("reason") or "-", inline=False)
         embed.add_field(
             name="結果", value=f"{result_text}（対応者: {interaction.user.mention}）", inline=False
         )
