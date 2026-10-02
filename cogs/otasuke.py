@@ -27,11 +27,6 @@ CATEGORY_CHANNEL_NAMES = {
 SYNC_CATEGORY_NAME = "おたすけ募集"
 RESERVATION_CHANNEL_NAME = "おたすけ-予約"
 
-RESERVE_CATEGORY_CHOICES = [
-    app_commands.Choice(name="通常", value="通常"),
-    app_commands.Choice(name="乱入", value="乱入"),
-]
-
 CHARACTER_CODE_LENGTH = 8
 CHARACTER_CODE_PATTERN = re.compile(rf"^[a-z0-9]{{{CHARACTER_CODE_LENGTH}}}$")
 TIME_ONLY_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -784,30 +779,6 @@ class OtasukeCog(commands.Cog):
             lines.append("既存を再利用: " + ", ".join(reused))
 
         await interaction.followup.send("\n".join(lines), ephemeral=True)
-
-    @otasuke_group.command(name="reserve", description="指定した日時に自動でおたすけ募集を投稿します")
-    @app_commands.describe(
-        category="種別(通常/乱入)",
-        time="投稿する時刻。「21:00」または「10/05 21:00」の形式（日本時間）",
-        level="ボスのレベル(乱入の場合は必須)",
-        details="詳細情報(任意)",
-    )
-    @app_commands.choices(category=RESERVE_CATEGORY_CHOICES)
-    async def reserve(
-        self,
-        interaction: discord.Interaction,
-        category: app_commands.Choice[str],
-        time: str,
-        level: int | None = None,
-        details: str | None = None,
-    ):
-        await self.create_reservation(
-            interaction=interaction,
-            battle_type=category.value,
-            time_str=time,
-            level=level,
-            details=details,
-        )
 
     async def create_reservation(
         self,
