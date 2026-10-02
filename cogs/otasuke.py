@@ -25,6 +25,7 @@ CATEGORY_CHANNEL_NAMES = {
 }
 
 SYNC_CATEGORY_NAME = "おたすけ募集"
+RESERVATION_CHANNEL_NAME = "おたすけ-予約"
 
 RESERVE_CATEGORY_CHOICES = [
     app_commands.Choice(name="通常", value="通常"),
@@ -231,6 +232,35 @@ class ReservePanelView(discord.ui.View):
         )
 
 
+class ReservationParticipationView(discord.ui.View):
+    def __init__(self, cog: "OtasukeCog", reservation_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.reservation_id = reservation_id
+
+        join = discord.ui.Button(
+            label="参加",
+            style=discord.ButtonStyle.success,
+            custom_id=f"otasuke_reservation_join_{reservation_id}",
+        )
+        join.callback = self._join
+        self.add_item(join)
+
+        leave = discord.ui.Button(
+            label="参加キャンセル",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"otasuke_reservation_leave_{reservation_id}",
+        )
+        leave.callback = self._leave
+        self.add_item(leave)
+
+    async def _join(self, interaction: discord.Interaction):
+        await self.cog.toggle_reservation_participant(interaction, self.reservation_id, join=True)
+
+    async def _leave(self, interaction: discord.Interaction):
+        await self.cog.toggle_reservation_participant(interaction, self.reservation_id, join=False)
+
+
 class CodeChangeApprovalView(discord.ui.View):
     def __init__(self, cog: "OtasukeCog", request_id: int):
         super().__init__(timeout=None)
@@ -273,6 +303,7 @@ class OtasukeCog(commands.Cog):
         self.approval_role_ids: dict[int, int] = {}
         self.approval_channel_ids: dict[int, int] = {}
         self.pending_code_changes: dict[int, dict] = {}
+        self.reservation_channel_ids: dict[int, int] = {}
         self.reservations: dict[int, dict] = {}
         self._next_reservation_id = 1
         self._next_request_id = 1
@@ -292,6 +323,13 @@ class OtasukeCog(commands.Cog):
                 CodeChangeApprovalView(self, request_id), message_id=data["message_id"]
             )
 
+        for reservation_id, data in self.reservations.items():
+            if data.get("announcement_message_id"):
+                self.bot.add_view(
+                    ReservationParticipationView(self, reservation_id),
+                    message_id=data["announcement_message_id"],
+                )
+
     def _save_state(self) -> None:
         state = {
             "role_ids": {str(gid): roles for gid, roles in self.role_ids.items()},
@@ -304,6 +342,9 @@ class OtasukeCog(commands.Cog):
             "pending_code_changes": {
                 str(rid): data for rid, data in self.pending_code_changes.items()
             },
+            "reservation_channel_ids": {
+                str(gid): cid for gid, cid in self.reservation_channel_ids.items()
+            },
             "reservations": {
                 str(rid): {
                     "user_id": data["user_id"],
@@ -314,6 +355,9 @@ class OtasukeCog(commands.Cog):
                     "character_code": data["character_code"],
                     "details": data["details"],
                     "scheduled_at": data["scheduled_at"].isoformat(),
+                    "participants": data.get("participants", []),
+                    "announcement_channel_id": data.get("announcement_channel_id"),
+                    "announcement_message_id": data.get("announcement_message_id"),
                 }
                 for rid, data in self.reservations.items()
             },
@@ -353,6 +397,9 @@ class OtasukeCog(commands.Cog):
         self.pending_code_changes = {
             int(rid): data for rid, data in state.get("pending_code_changes", {}).items()
         }
+        self.reservation_channel_ids = {
+            int(gid): cid for gid, cid in state.get("reservation_channel_ids", {}).items()
+        }
         self.reservations = {
             int(rid): {
                 "user_id": data["user_id"],
@@ -363,6 +410,9 @@ class OtasukeCog(commands.Cog):
                 "character_code": data["character_code"],
                 "details": data["details"],
                 "scheduled_at": datetime.fromisoformat(data["scheduled_at"]),
+                "participants": data.get("participants", []),
+                "announcement_channel_id": data.get("announcement_channel_id"),
+                "announcement_message_id": data.get("announcement_message_id"),
             }
             for rid, data in state.get("reservations", {}).items()
         }
@@ -454,6 +504,22 @@ class OtasukeCog(commands.Cog):
         self._save_state()
         await interaction.response.send_message(
             f"キャラクターコードの変更申請の送信先を {channel.mention} に設定しました。",
+            ephemeral=True,
+        )
+
+    @otasuke_group.command(
+        name="setreservationchannel",
+        description="おたすけ予約の開始前告知を送信するチャンネルを設定します",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe(channel="告知の送信先チャンネル")
+    async def set_reservation_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel
+    ):
+        self.reservation_channel_ids[interaction.guild_id] = channel.id
+        self._save_state()
+        await interaction.response.send_message(
+            f"おたすけ予約の告知の送信先を {channel.mention} に設定しました。",
             ephemeral=True,
         )
 
@@ -690,6 +756,18 @@ class OtasukeCog(commands.Cog):
                 else:
                     reused.append(channel.mention)
                 guild_channel_ids[key] = channel.id
+
+            reservation_channel = discord.utils.get(
+                category.text_channels, name=RESERVATION_CHANNEL_NAME
+            )
+            if reservation_channel is None:
+                reservation_channel = await guild.create_text_channel(
+                    RESERVATION_CHANNEL_NAME, category=category
+                )
+                created.append(reservation_channel.mention)
+            else:
+                reused.append(reservation_channel.mention)
+            self.reservation_channel_ids[guild.id] = reservation_channel.id
         except discord.Forbidden:
             await interaction.followup.send(
                 "チャンネルの作成に失敗しました。botに「チャンネルの管理」権限があるか確認してください。",
@@ -773,12 +851,24 @@ class OtasukeCog(commands.Cog):
             )
             return
 
+        announce_channel_id = self.reservation_channel_ids.get(guild.id)
+        announce_channel = (
+            self.bot.get_channel(announce_channel_id) if announce_channel_id else None
+        )
+        if announce_channel is None:
+            await interaction.response.send_message(
+                "予約の告知先チャンネルが未設定です。"
+                "管理者に `/otasuke setreservationchannel` または `/otasuke sync` の設定を依頼してください。",
+                ephemeral=True,
+            )
+            return
+
         delay_seconds = (scheduled_at - now).total_seconds()
 
         reservation_id = self._next_reservation_id
         self._next_reservation_id += 1
 
-        self.reservations[reservation_id] = {
+        reservation_data = {
             "user_id": interaction.user.id,
             "guild_id": guild.id,
             "channel_id": interaction.channel_id,
@@ -787,17 +877,92 @@ class OtasukeCog(commands.Cog):
             "character_code": code_value,
             "details": details,
             "scheduled_at": scheduled_at,
+            "participants": [],
         }
+
+        announce_embed = self._build_reservation_embed(reservation_data)
+        announce_message = await announce_channel.send(
+            embed=announce_embed,
+            view=ReservationParticipationView(self, reservation_id),
+        )
+        reservation_data["announcement_channel_id"] = announce_channel.id
+        reservation_data["announcement_message_id"] = announce_message.id
+
+        self.reservations[reservation_id] = reservation_data
         self.reservations[reservation_id]["task"] = asyncio.create_task(
             self._fire_reservation(reservation_id, delay_seconds)
         )
         self._save_state()
 
         await interaction.response.send_message(
-            f"予約を受け付けました（ID: {reservation_id}）。"
+            f"予約を受け付けました（ID: {reservation_id}）。{announce_channel.mention} に告知を投稿しました。"
             f"{scheduled_at.strftime('%m/%d %H:%M')} 頃に自動投稿します（日本時間）。",
             ephemeral=True,
         )
+
+    def _build_reservation_embed(self, data: dict) -> discord.Embed:
+        if data["battle_type"] == "通常":
+            label = "通常"
+        elif data.get("level") is not None:
+            label = f"乱入（LV{data['level']}）"
+        else:
+            label = "乱入"
+
+        embed = discord.Embed(
+            title="⏰ おたすけ予約",
+            description=(
+                f"{data['scheduled_at'].strftime('%m/%d %H:%M')} 頃に開始予定です"
+                "（日本時間）。参加する方は下のボタンを押してください。"
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="種別", value=label, inline=True)
+        embed.add_field(name="主催者", value=f"<@{data['user_id']}>", inline=True)
+
+        participants = data.get("participants", [])
+        embed.add_field(
+            name=f"参加者（{len(participants)}人）",
+            value=" ".join(f"<@{uid}>" for uid in participants) if participants else "まだいません",
+            inline=False,
+        )
+
+        if data.get("details"):
+            embed.add_field(name="詳細情報", value=data["details"], inline=False)
+
+        return embed
+
+    async def toggle_reservation_participant(
+        self, interaction: discord.Interaction, reservation_id: int, join: bool
+    ):
+        data = self.reservations.get(reservation_id)
+        if data is None:
+            await interaction.response.send_message(
+                "この予約は見つかりませんでした（キャンセル済みの可能性があります）。",
+                ephemeral=True,
+            )
+            return
+
+        participants = data.setdefault("participants", [])
+        user_id = interaction.user.id
+
+        if join:
+            if user_id in participants:
+                await interaction.response.send_message("すでに参加登録済みです。", ephemeral=True)
+                return
+            participants.append(user_id)
+            result_text = "参加登録しました！"
+        else:
+            if user_id not in participants:
+                await interaction.response.send_message("参加登録されていません。", ephemeral=True)
+                return
+            participants.remove(user_id)
+            result_text = "参加をキャンセルしました。"
+
+        self._save_state()
+
+        embed = self._build_reservation_embed(data)
+        await interaction.response.edit_message(embed=embed)
+        await interaction.followup.send(result_text, ephemeral=True)
 
     @otasuke_group.command(name="reservations", description="自分が予約したおたすけ募集の一覧を確認します")
     async def list_reservations(self, interaction: discord.Interaction):
@@ -832,6 +997,9 @@ class OtasukeCog(commands.Cog):
         reservation["task"].cancel()
         self.reservations.pop(reservation_id, None)
         self._save_state()
+
+        await self._mark_announcement(reservation, "❌ この予約はキャンセルされました。", discord.Color.red())
+
         await interaction.response.send_message(
             f"予約（ID: {reservation_id}）を取り消しました。", ephemeral=True
         )
@@ -851,6 +1019,8 @@ class OtasukeCog(commands.Cog):
         if guild is None:
             return
 
+        participant_mentions = [f"<@{uid}>" for uid in data.get("participants", [])]
+
         fallback_channel = self.bot.get_channel(data["channel_id"])
         sent = await self._send_recruitment(
             guild=guild,
@@ -860,6 +1030,7 @@ class OtasukeCog(commands.Cog):
             character_code=data["character_code"],
             details=data["details"],
             fallback_channel=fallback_channel,
+            extra_mentions=participant_mentions,
         )
         if not sent and fallback_channel is not None:
             try:
@@ -868,6 +1039,29 @@ class OtasukeCog(commands.Cog):
                 )
             except discord.HTTPException:
                 pass
+
+        await self._mark_announcement(data, "✅ 開始しました！", discord.Color.green())
+
+    async def _mark_announcement(
+        self, data: dict, status_text: str, color: discord.Color
+    ) -> None:
+        channel_id = data.get("announcement_channel_id")
+        message_id = data.get("announcement_message_id")
+        if not channel_id or not message_id:
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            return
+
+        try:
+            message = await channel.fetch_message(message_id)
+            embed = self._build_reservation_embed(data)
+            embed.color = color
+            embed.description = status_text
+            await message.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
 
     async def _send_recruitment(
         self,
@@ -878,6 +1072,7 @@ class OtasukeCog(commands.Cog):
         character_code: str,
         details: str | None,
         fallback_channel: discord.abc.Messageable | None,
+        extra_mentions: list[str] | None = None,
     ) -> bool:
         category_key = self._category_key(battle_type, level)
 
@@ -898,11 +1093,14 @@ class OtasukeCog(commands.Cog):
         embed.add_field(name="詳細情報", value=details or "-", inline=False)
 
         role_id = self.role_ids.get(guild.id, {}).get(category_key)
-        content = None
+        mentions = []
         if role_id:
             role = guild.get_role(role_id)
             if role:
-                content = role.mention
+                mentions.append(role.mention)
+        if extra_mentions:
+            mentions.extend(extra_mentions)
+        content = " ".join(mentions) if mentions else None
 
         await channel.send(content=content, embed=embed)
         return True
