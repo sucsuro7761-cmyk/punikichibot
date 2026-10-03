@@ -10,20 +10,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-CATEGORY_CHOICES = [
-    app_commands.Choice(name="通常", value="normal"),
-    app_commands.Choice(name="乱入（LV1〜4）", value="intrusion_1_4"),
-    app_commands.Choice(name="乱入（LV5〜8）", value="intrusion_5_8"),
-    app_commands.Choice(name="乱入（LV9〜）", value="intrusion_9_plus"),
-]
-
-CATEGORY_CHANNEL_NAMES = {
-    "normal": "おたすけ-通常",
-    "intrusion_1_4": "おたすけ-乱入lv1-4",
-    "intrusion_5_8": "おたすけ-乱入lv5-8",
-    "intrusion_9_plus": "おたすけ-乱入lv9",
-}
-
 SYNC_CATEGORY_NAME = "おたすけ募集"
 RESERVATION_CHANNEL_NAME = "おたすけ-予約"
 
@@ -216,8 +202,7 @@ class OtasukeCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.role_ids: dict[int, dict[str, int]] = {}
-        self.channel_ids: dict[int, dict[str, int]] = {}
+        self.role_ids: dict[int, int] = {}
         self.character_codes: dict[int, str] = {}
         self.approval_role_ids: dict[int, int] = {}
         self.approval_channel_ids: dict[int, int] = {}
@@ -251,8 +236,7 @@ class OtasukeCog(commands.Cog):
 
     def _save_state(self) -> None:
         state = {
-            "role_ids": {str(gid): roles for gid, roles in self.role_ids.items()},
-            "channel_ids": {str(gid): chans for gid, chans in self.channel_ids.items()},
+            "role_ids": {str(gid): rid for gid, rid in self.role_ids.items()},
             "character_codes": {str(uid): code for uid, code in self.character_codes.items()},
             "approval_role_ids": {str(gid): rid for gid, rid in self.approval_role_ids.items()},
             "approval_channel_ids": {
@@ -299,10 +283,7 @@ class OtasukeCog(commands.Cog):
             return
 
         self.role_ids = {
-            int(gid): dict(roles) for gid, roles in state.get("role_ids", {}).items()
-        }
-        self.channel_ids = {
-            int(gid): dict(chans) for gid, chans in state.get("channel_ids", {}).items()
+            int(gid): rid for gid, rid in state.get("role_ids", {}).items()
         }
         self.character_codes = {
             int(uid): code for uid, code in state.get("character_codes", {}).items()
@@ -337,16 +318,6 @@ class OtasukeCog(commands.Cog):
         }
         self._next_reservation_id = state.get("next_reservation_id", 1)
         self._next_request_id = state.get("next_request_id", 1)
-
-    @staticmethod
-    def _category_key(battle_type: str, level: int | None) -> str:
-        if battle_type == "通常":
-            return "normal"
-        if level is not None and level <= 4:
-            return "intrusion_1_4"
-        if level is not None and level <= 8:
-            return "intrusion_5_8"
-        return "intrusion_9_plus"
 
     @otasuke_group.command(
         name="registercode", description="おたすけ募集で使うキャラクターコードを登録します"
@@ -605,39 +576,19 @@ class OtasukeCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, view=ReservePanelView(self))
 
-    @otasuke_group.command(name="setrole", description="種別ごとに募集時のメンションロールを設定します")
+    @otasuke_group.command(name="setrole", description="募集時にメンションするロールを設定します")
     @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.describe(category="設定する種別", role="メンションするロール")
-    @app_commands.choices(category=CATEGORY_CHOICES)
-    async def setrole(
-        self, interaction: discord.Interaction, category: app_commands.Choice[str], role: discord.Role
-    ):
-        self.role_ids.setdefault(interaction.guild_id, {})[category.value] = role.id
+    @app_commands.describe(role="メンションするロール")
+    async def setrole(self, interaction: discord.Interaction, role: discord.Role):
+        self.role_ids[interaction.guild_id] = role.id
         self._save_state()
         await interaction.response.send_message(
-            f"「{category.name}」の募集時に {role.mention} にメンションするよう設定しました。",
-            ephemeral=True,
-        )
-
-    @otasuke_group.command(name="setchannel", description="種別ごとに募集の投稿先チャンネルを設定します")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.describe(category="設定する種別", channel="投稿先チャンネル")
-    @app_commands.choices(category=CATEGORY_CHOICES)
-    async def setchannel(
-        self,
-        interaction: discord.Interaction,
-        category: app_commands.Choice[str],
-        channel: discord.TextChannel,
-    ):
-        self.channel_ids.setdefault(interaction.guild_id, {})[category.value] = channel.id
-        self._save_state()
-        await interaction.response.send_message(
-            f"「{category.name}」の募集の投稿先を {channel.mention} に設定しました。",
+            f"募集時に {role.mention} にメンションするよう設定しました。",
             ephemeral=True,
         )
 
     @otasuke_group.command(
-        name="sync", description="おたすけ募集用のチャンネルをカテゴリごと自動作成・設定します"
+        name="sync", description="おたすけ予約用のチャンネルを自動作成・設定します"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def sync(self, interaction: discord.Interaction):
@@ -653,19 +604,6 @@ class OtasukeCog(commands.Cog):
             if category is None:
                 category = await guild.create_category(SYNC_CATEGORY_NAME)
 
-            guild_channel_ids = self.channel_ids.setdefault(guild.id, {})
-            created = []
-            reused = []
-
-            for key, channel_name in CATEGORY_CHANNEL_NAMES.items():
-                channel = discord.utils.get(category.text_channels, name=channel_name)
-                if channel is None:
-                    channel = await guild.create_text_channel(channel_name, category=category)
-                    created.append(channel.mention)
-                else:
-                    reused.append(channel.mention)
-                guild_channel_ids[key] = channel.id
-
             reservation_channel = discord.utils.get(
                 category.text_channels, name=RESERVATION_CHANNEL_NAME
             )
@@ -673,9 +611,9 @@ class OtasukeCog(commands.Cog):
                 reservation_channel = await guild.create_text_channel(
                     RESERVATION_CHANNEL_NAME, category=category
                 )
-                created.append(reservation_channel.mention)
+                status = "作成"
             else:
-                reused.append(reservation_channel.mention)
+                status = "既存を再利用"
             self.reservation_channel_ids[guild.id] = reservation_channel.id
         except discord.Forbidden:
             await interaction.followup.send(
@@ -686,13 +624,11 @@ class OtasukeCog(commands.Cog):
 
         self._save_state()
 
-        lines = [f"カテゴリ「{category.name}」にチャンネルを同期しました。"]
-        if created:
-            lines.append("作成: " + ", ".join(created))
-        if reused:
-            lines.append("既存を再利用: " + ", ".join(reused))
-
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        await interaction.followup.send(
+            f"カテゴリ「{category.name}」の {reservation_channel.mention} を"
+            f"予約告知・募集投稿先として同期しました（{status}）。",
+            ephemeral=True,
+        )
 
     async def create_reservation(
         self,
@@ -906,7 +842,9 @@ class OtasukeCog(commands.Cog):
 
         participant_mentions = [f"<@{uid}>" for uid in data.get("participants", [])]
 
-        fallback_channel = self.bot.get_channel(data["channel_id"])
+        channel = self.bot.get_channel(
+            data.get("announcement_channel_id")
+        ) or self.bot.get_channel(data["channel_id"])
         sent = await self._send_recruitment(
             guild=guild,
             author_mention=f"<@{data['user_id']}>",
@@ -914,15 +852,19 @@ class OtasukeCog(commands.Cog):
             level=data["level"],
             character_code=data["character_code"],
             details=data["details"],
-            fallback_channel=fallback_channel,
+            channel=channel,
             extra_mentions=participant_mentions,
         )
-        if not sent and fallback_channel is not None:
+        if not sent:
             try:
-                await fallback_channel.send(
-                    f"<@{data['user_id']}> 予約投稿に失敗しました。投稿先チャンネルの設定を確認してください。"
+                organizer = guild.get_member(data["user_id"]) or await self.bot.fetch_user(
+                    data["user_id"]
                 )
-            except discord.HTTPException:
+                await organizer.send(
+                    "予約投稿に失敗しました。投稿先チャンネルが見つかりません。"
+                    "`/otasuke sync` などで設定を確認してください。"
+                )
+            except (discord.Forbidden, discord.HTTPException):
                 pass
 
         await self._mark_announcement(data, "✅ 開始しました！", discord.Color.green())
@@ -956,14 +898,9 @@ class OtasukeCog(commands.Cog):
         level: int | None,
         character_code: str,
         details: str | None,
-        fallback_channel: discord.abc.Messageable | None,
+        channel: discord.abc.Messageable | None,
         extra_mentions: list[str] | None = None,
     ) -> bool:
-        category_key = self._category_key(battle_type, level)
-
-        channel_id = self.channel_ids.get(guild.id, {}).get(category_key)
-        channel = self.bot.get_channel(channel_id) if channel_id else fallback_channel
-
         if channel is None:
             return False
 
@@ -977,7 +914,7 @@ class OtasukeCog(commands.Cog):
         embed.add_field(name="募集者", value=author_mention, inline=True)
         embed.add_field(name="詳細情報", value=details or "-", inline=False)
 
-        role_id = self.role_ids.get(guild.id, {}).get(category_key)
+        role_id = self.role_ids.get(guild.id)
         mentions = []
         if role_id:
             role = guild.get_role(role_id)
@@ -989,6 +926,7 @@ class OtasukeCog(commands.Cog):
 
         await channel.send(content=content, embed=embed)
         return True
+
 
 async def setup(bot: commands.Bot):
     cog = OtasukeCog(bot)
