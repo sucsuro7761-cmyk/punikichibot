@@ -67,82 +67,6 @@ def _parse_reserve_time(raw: str, now: datetime) -> datetime | None:
     return None
 
 
-class OtasukeModal(discord.ui.Modal):
-    def __init__(self, cog: "OtasukeCog", battle_type: str, include_level: bool, character_code: str):
-        super().__init__(title=f"おたすけ募集（{battle_type}）")
-        self.cog = cog
-        self.battle_type = battle_type
-        self.character_code = character_code
-
-        self.level: discord.ui.TextInput | None = None
-        if include_level:
-            self.level = discord.ui.TextInput(
-                label="ボスのレベル",
-                placeholder="例: 12",
-                required=True,
-                max_length=3,
-            )
-            self.add_item(self.level)
-
-        self.details = discord.ui.TextInput(
-            label="詳細情報",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=500,
-        )
-        self.add_item(self.details)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        level_value = None
-        if self.level is not None:
-            raw_level = str(self.level.value).strip()
-            if not raw_level.isdigit() or int(raw_level) < 1:
-                await interaction.response.send_message(
-                    "レベルは1以上の数字で入力してください。", ephemeral=True
-                )
-                return
-            level_value = int(raw_level)
-
-        await self.cog.post_recruitment(
-            interaction=interaction,
-            battle_type=self.battle_type,
-            level=level_value,
-            character_code=self.character_code,
-            details=str(self.details.value) if self.details.value else None,
-        )
-
-
-class OtasukePanelView(discord.ui.View):
-    def __init__(self, cog: "OtasukeCog"):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    @discord.ui.button(
-        label="通常で募集", style=discord.ButtonStyle.primary, custom_id="otasuke_normal_button"
-    )
-    async def normal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._open_modal(interaction, "通常", include_level=False)
-
-    @discord.ui.button(
-        label="乱入で募集", style=discord.ButtonStyle.danger, custom_id="otasuke_intrusion_button"
-    )
-    async def intrusion_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._open_modal(interaction, "乱入", include_level=True)
-
-    async def _open_modal(self, interaction: discord.Interaction, battle_type: str, include_level: bool):
-        code = self.cog.character_codes.get(interaction.user.id)
-        if code is None:
-            await interaction.response.send_message(
-                "キャラクターコードが未登録です。`/otasuke registercode` で登録してください。",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_modal(
-            OtasukeModal(self.cog, battle_type, include_level=include_level, character_code=code)
-        )
-
-
 class ReserveModal(discord.ui.Modal):
     def __init__(self, cog: "OtasukeCog", battle_type: str, include_level: bool):
         super().__init__(title=f"おたすけ予約（{battle_type}）")
@@ -671,16 +595,6 @@ class OtasukeCog(commands.Cog):
 
         await interaction.response.send_message(f"登録中のキャラクターコード: `{code}`", ephemeral=True)
 
-    @otasuke_group.command(name="panel", description="おたすけ募集パネルを設置します")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def panel(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="🆘 おたすけ募集",
-            description="ボタンを押して募集内容を入力してください。",
-            color=discord.Color.blue(),
-        )
-        await interaction.response.send_message(embed=embed, view=OtasukePanelView(self))
-
     @otasuke_group.command(name="reservepanel", description="おたすけ予約専用パネルを設置します")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def reserve_panel(self, interaction: discord.Interaction):
@@ -1076,41 +990,7 @@ class OtasukeCog(commands.Cog):
         await channel.send(content=content, embed=embed)
         return True
 
-    async def post_recruitment(
-        self,
-        interaction: discord.Interaction,
-        battle_type: str,
-        level: int | None,
-        character_code: str,
-        details: str | None,
-    ):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
-            return
-
-        sent = await self._send_recruitment(
-            guild=guild,
-            author_mention=interaction.user.mention,
-            battle_type=battle_type,
-            level=level,
-            character_code=character_code,
-            details=details,
-            fallback_channel=interaction.channel,
-        )
-
-        if not sent:
-            await interaction.response.send_message(
-                "投稿先チャンネルが見つかりません。`/otasuke setchannel` または `/otasuke sync` で設定してください。",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_message("募集を投稿しました！", ephemeral=True)
-
-
 async def setup(bot: commands.Bot):
     cog = OtasukeCog(bot)
     await bot.add_cog(cog)
-    bot.add_view(OtasukePanelView(cog))
     bot.add_view(ReservePanelView(cog))
